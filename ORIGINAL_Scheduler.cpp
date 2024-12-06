@@ -99,7 +99,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     if(task_info.required_sla == SLA0) {
         priority = HIGH_PRIORITY;
     }
-    else if(task_info.required_sla == SLA1 || task_info.required_sla == SLA2) {
+    else if(task_info.required_sla == SLA1) {
+        priority = MID_PRIORITY;
+    }
+    else if(task_info.required_sla == SLA2) {
         priority = MID_PRIORITY;
     }
     // SLA3 remains LOW_PRIORITY
@@ -115,12 +118,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         }
 
         VMInfo_t vm_info = VM_GetInfo(vm_id);
-        if(vm_info.vm_type != task_info.required_vm) {
-            continue; // Skip incompatible VM types
-        }
-
-        if(vm_info.cpu != task_info.required_cpu) {
-            continue; // Skip incompatible CPU types
+        
+        // Check VM type and CPU compatibility
+        if(vm_info.vm_type != task_info.required_vm || vm_info.cpu != task_info.required_cpu) {
+            continue; // Skip incompatible VMs
         }
 
         // Check GPU capability if required
@@ -142,7 +143,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             continue; // Not enough memory
         }
 
-        // Categorize VMs based on priority
+        // Categorize VMs based on current priority
         if(priority == HIGH_PRIORITY) {
             high_priority_vms.push_back(vm_id);
         }
@@ -154,16 +155,17 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         }
     }
 
-    // Function to assign task to a list of VMs using Best-Fit strategy
+    // Function to assign task to a list of VMs
     auto assign_task = [&](const vector<VMId_t>& vm_list) -> bool {
+        // Best-Fit: Assign to VM with least remaining memory after assignment
         VMId_t best_vm = -1;
-        unsigned least_remaining_memory = UINT_MAX;
+        unsigned least_remaining = UINT_MAX;
 
         for(auto vm_id : vm_list) {
             MachineInfo_t machine_info = Machine_GetInfo(VM_GetInfo(vm_id).machine_id);
             unsigned remaining_memory = machine_info.memory_size - machine_info.memory_used - task_memory;
-            if(remaining_memory < least_remaining_memory) {
-                least_remaining_memory = remaining_memory;
+            if(remaining_memory < least_remaining) {
+                least_remaining = remaining_memory;
                 best_vm = vm_id;
             }
         }
@@ -235,13 +237,12 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
     if(target_machine != -1) {
         try {
-            VMType_t vm_type = task_info.required_vm;
-            VMId_t new_vm = VM_Create(vm_type, task_info.required_cpu);
+            VMId_t new_vm = VM_Create(task_info.required_vm, task_info.required_cpu);
             VM_Attach(new_vm, target_machine);
             vms.push_back(new_vm);
-            migrating_vms.insert(new_vm); // Mark as migrating
+            migrating_vms.insert(new_vm); // Mark as migrating to prevent immediate assignment
 
-            // Optionally, wait for MigrationDone to assign the task
+            // Optionally, you can wait for MigrationDone to assign the task
             // For simplicity, assigning immediately assuming VM is ready after Attach
             VM_AddTask(new_vm, task_id, priority);
             task_to_vm_map[task_id] = new_vm;
@@ -259,6 +260,8 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // If still no suitable VM found, log failure
     SimOutput("NewTask(): No suitable VM found for task " + to_string(task_id), 0);
 }
+
+
 
 
 MachineId_t FindLessLoadedMachine(MachineId_t current_machine) {

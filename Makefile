@@ -31,3 +31,24 @@ $(TARGET): $(OBJ)
 
 run:
 	./simulator -v 3 Input.md
+
+hour:
+	./simulator -v 3 GentlerHour
+
+nice:
+	./simulator -v 3 Nice
+
+spikey:
+	./simulator -v 3 Spikey
+
+bigsmall:
+	./simulator -v 3 BigSmall
+
+match:
+	./simulator -v 3 MatchMe-1
+
+spikey2:
+	./simulator -v 3 Spikey2
+
+tallshort:
+	./simulator -v 3 TallAndShort
