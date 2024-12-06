@@ -20,22 +20,50 @@ static unsigned active_machines;
 void Scheduler::Init() {
     // Get actual number of machines from the system
     unsigned total_machines = Machine_GetTotal();
-    active_machines = total_machines;  // Use actual total instead of hardcoded 16
+    active_machines = total_machines;  // Use actual total instead of hardcoded value
 
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler", 1);
+    SimOutput("Scheduler::Init(): Initializing scheduler with diverse machine types", 1);
 
-    // Create VMs and track machines based on actual total
+    // Populate 'machines' vector with all MachineId_t
+    // Assuming MachineId_t can be retrieved sequentially from 0 to total_machines - 1
     for(unsigned i = 0; i < active_machines; i++) {
-        vms.push_back(VM_Create(LINUX, X86));
-        machines.push_back(MachineId_t(i));
-    }    
+        MachineId_t machine_id = i; // Ensure this correctly represents the actual machine IDs
+        machines.push_back(machine_id);
+    }
 
-    // Attach VMs to machines
-    for(unsigned i = 0; i < active_machines; i++) {
-        VM_Attach(vms[i], machines[i]);
+    // Create and attach VMs based on each machine's CPU type and GPU availability
+    for(auto machine_id : machines) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        VMType_t vm_type;
+        switch(machine_info.cpu) {
+            case X86:
+                vm_type = LINUX;
+                break;
+            case ARM:
+                vm_type = LINUX; // Assuming LINUX for ARM; adjust if needed
+                break;
+            case POWER:
+                vm_type = AIX;
+                break;
+            default:
+                vm_type = LINUX; // Default to LINUX if CPU type is unrecognized
+        }
+
+        try {
+            VMId_t vm_id = VM_Create(vm_type, machine_info.cpu);
+            vms.push_back(vm_id);
+            VM_Attach(vm_id, machine_id);
+            SimOutput("Init(): VM " + to_string(vm_id) + " created and attached to Machine " + to_string(machine_id), 3);
+        } catch (const runtime_error& e) {
+            SimOutput("Init(): Exception creating VM for Machine " + to_string(machine_id) +
+                      ": " + e.what(), 2);
+        }
     }
 }
+
+
 
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
@@ -67,75 +95,165 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     unsigned task_memory = GetTaskMemory(task_id); // Get memory requirement of the task
 
     // Set priority based on SLA
-    Priority_t priority = (task_info.required_sla == SLA0 || task_info.required_sla == SLA1) 
-                         ? HIGH_PRIORITY 
-                         : (task_info.required_sla == SLA2 ? MID_PRIORITY : LOW_PRIORITY);
+    Priority_t priority = LOW_PRIORITY;
+    if(task_info.required_sla == SLA0) {
+        priority = HIGH_PRIORITY;
+    }
+    else if(task_info.required_sla == SLA1) {
+        priority = MID_PRIORITY;
+    }
+    else if(task_info.required_sla == SLA2) {
+        priority = MID_PRIORITY;
+    }
+    // SLA3 remains LOW_PRIORITY
 
-    VMId_t selected_vm = -1;
-    unsigned min_available_memory = UINT_MAX;
+    // Categorize VMs based on compatibility and readiness
+    vector<VMId_t> high_priority_vms;
+    vector<VMId_t> mid_priority_vms;
+    vector<VMId_t> low_priority_vms;
 
-    // Find the best-fit VM that is ready and has enough memory
-    for (VMId_t vm_id : vms) {
-        if (migrating_vms.find(vm_id) != migrating_vms.end()) {
-            continue;  // Skip migrating VMs
+    for(auto vm_id : vms) {
+        if(migrating_vms.find(vm_id) != migrating_vms.end()) {
+            continue; // Skip migrating VMs
         }
 
         VMInfo_t vm_info = VM_GetInfo(vm_id);
-        MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
-
-        // Ensure the machine is in S0 state
-        if (machine_info.s_state != S0) {
-            WakeUpMachineIfNeeded(vm_info.machine_id);
-            continue;  // Skip this VM for now
+        
+        // Check VM type and CPU compatibility
+        if(vm_info.vm_type != task_info.required_vm || vm_info.cpu != task_info.required_cpu) {
+            continue; // Skip incompatible VMs
         }
 
-        // Calculate available memory on the machine
-        unsigned available_memory = machine_info.memory_size - machine_info.memory_used;
-        if (available_memory >= task_memory) {
-            unsigned remaining_memory = available_memory - task_memory;
-            if (remaining_memory < min_available_memory) {
-                min_available_memory = remaining_memory;
-                selected_vm = vm_id;
+        // Check GPU capability if required
+        if(task_info.gpu_capable) {
+            MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
+            if(!machine_info.gpus) {
+                continue; // Skip VMs on machines without GPUs
             }
         }
-    }
 
-    // Assign the task to the best-fit VM if found
-    if (selected_vm != -1) {
-        try {
-            VM_AddTask(selected_vm, task_id, priority);
-            task_to_vm_map[task_id] = selected_vm;
-            SimOutput("NewTask(): Task " + to_string(task_id) + " assigned to VM " + to_string(selected_vm), 3);
-            return;
-        } catch (const runtime_error& e) {
-            SimOutput("NewTask(): Exception assigning task " + to_string(task_id) +
-                      " to VM " + to_string(selected_vm) + ": " + e.what(), 2);
+        MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
+        if(machine_info.s_state != S0) {
+            WakeUpMachineIfNeeded(vm_info.machine_id);
+            continue; // Skip if machine is not in S0 state
+        }
+
+        unsigned available_memory = machine_info.memory_size - machine_info.memory_used;
+        if(available_memory < task_memory) {
+            continue; // Not enough memory
+        }
+
+        // Categorize VMs based on current priority
+        if(priority == HIGH_PRIORITY) {
+            high_priority_vms.push_back(vm_id);
+        }
+        else if(priority == MID_PRIORITY) {
+            mid_priority_vms.push_back(vm_id);
+        }
+        else {
+            low_priority_vms.push_back(vm_id);
         }
     }
 
-    // If no suitable VM found, attempt to create a new VM on a ready machine with enough memory
-    for (MachineId_t machine_id : machines) {
+    // Function to assign task to a list of VMs
+    auto assign_task = [&](const vector<VMId_t>& vm_list) -> bool {
+        // Best-Fit: Assign to VM with least remaining memory after assignment
+        VMId_t best_vm = -1;
+        unsigned least_remaining = UINT_MAX;
+
+        for(auto vm_id : vm_list) {
+            MachineInfo_t machine_info = Machine_GetInfo(VM_GetInfo(vm_id).machine_id);
+            unsigned remaining_memory = machine_info.memory_size - machine_info.memory_used - task_memory;
+            if(remaining_memory < least_remaining) {
+                least_remaining = remaining_memory;
+                best_vm = vm_id;
+            }
+        }
+
+        if(best_vm != -1) {
+            try {
+                VM_AddTask(best_vm, task_id, priority);
+                task_to_vm_map[task_id] = best_vm;
+                SimOutput("NewTask(): Task " + to_string(task_id) + " assigned to VM " + to_string(best_vm), 3);
+                return true;
+            }
+            catch(const runtime_error& e) {
+                SimOutput("NewTask(): Exception assigning task " + to_string(task_id) +
+                          " to VM " + to_string(best_vm) + ": " + e.what(), 2);
+                return false;
+            }
+        }
+        return false;
+    };
+
+    // Attempt to assign based on priority
+    if(priority == HIGH_PRIORITY) {
+        if(assign_task(high_priority_vms)) return;
+    }
+    if(priority == MID_PRIORITY) {
+        if(assign_task(mid_priority_vms)) return;
+    }
+    if(priority == LOW_PRIORITY) {
+        if(assign_task(low_priority_vms)) return;
+    }
+
+    // If not assigned yet, attempt to assign to any suitable VM
+    vector<VMId_t> all_suitable_vms = high_priority_vms;
+    all_suitable_vms.insert(all_suitable_vms.end(), mid_priority_vms.begin(), mid_priority_vms.end());
+    all_suitable_vms.insert(all_suitable_vms.end(), low_priority_vms.begin(), low_priority_vms.end());
+
+    if(assign_task(all_suitable_vms)) return;
+
+    // If no suitable VM found, attempt to create a new VM on a compatible machine
+    // Prioritize machines with GPUs if the task requires it
+    bool gpu_required = task_info.gpu_capable;
+    MachineId_t target_machine = -1;
+    unsigned max_available_memory = 0;
+
+    for(auto machine_id : machines) {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
 
-        // Ensure the machine is ready and has enough memory
-        if (machine_info.s_state == S0 && 
-            (machine_info.memory_size - machine_info.memory_used) >= task_memory) {
-            try {
-                VMId_t new_vm = VM_Create(LINUX, machine_info.cpu);
-                VM_Attach(new_vm, machine_id);
-                vms.push_back(new_vm);
-                migrating_vms.insert(new_vm); // Mark the new VM as migrating to prevent immediate assignment
+        // Ensure machine is ready
+        if(machine_info.s_state != S0) {
+            continue;
+        }
 
-                // Assign the task to the new VM after ensuring it's ready
-                VM_AddTask(new_vm, task_id, priority);
-                task_to_vm_map[task_id] = new_vm;
-                migrating_vms.erase(new_vm); // VM is now ready
-                SimOutput("NewTask(): Task " + to_string(task_id) + " assigned to new VM " + to_string(new_vm) + " on Machine " + to_string(machine_id), 3);
-                return;
-            } catch (const runtime_error& e) {
-                SimOutput("NewTask(): Exception assigning task " + to_string(task_id) +
-                          " to new VM on Machine " + to_string(machine_id) + ": " + e.what(), 2);
-            }
+        // Check CPU type
+        if(machine_info.cpu != task_info.required_cpu) {
+            continue;
+        }
+
+        // Check GPU capability if required
+        if(gpu_required && !machine_info.gpus) {
+            continue;
+        }
+
+        unsigned available_memory = machine_info.memory_size - machine_info.memory_used;
+        if(available_memory >= task_memory && available_memory > max_available_memory) {
+            max_available_memory = available_memory;
+            target_machine = machine_id;
+        }
+    }
+
+    if(target_machine != -1) {
+        try {
+            VMId_t new_vm = VM_Create(task_info.required_vm, task_info.required_cpu);
+            VM_Attach(new_vm, target_machine);
+            vms.push_back(new_vm);
+            migrating_vms.insert(new_vm); // Mark as migrating to prevent immediate assignment
+
+            // Optionally, you can wait for MigrationDone to assign the task
+            // For simplicity, assigning immediately assuming VM is ready after Attach
+            VM_AddTask(new_vm, task_id, priority);
+            task_to_vm_map[task_id] = new_vm;
+            migrating_vms.erase(new_vm); // VM is now ready
+            SimOutput("NewTask(): Task " + to_string(task_id) + " assigned to new VM " + to_string(new_vm) +
+                      " on Machine " + to_string(target_machine), 3);
+            return;
+        }
+        catch(const runtime_error& e) {
+            SimOutput("NewTask(): Exception assigning task " + to_string(task_id) +
+                      " to new VM on Machine " + to_string(target_machine) + ": " + e.what(), 2);
         }
     }
 
