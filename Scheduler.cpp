@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <climits>
 
-static bool migrating = true;
-// static unsigned active_machines = 16;
 
+
+// Global state variables
+//static bool migrating = true; 
+// currently, we do not support migration.
 static vector<VMId_t> vms;
 static vector<MachineId_t> machines;
 static unordered_map<TaskId_t, VMId_t> task_to_vm_map;
@@ -20,18 +22,37 @@ static unordered_map<MachineId_t, unsigned int> machine_task_count;
 static unordered_set<VMId_t> migrating_vms;
 static unsigned active_machines;
 
+
+
+// Helper function to find less loaded machine
+MachineId_t FindLessLoadedMachine(MachineId_t current_machine) {
+    MachineId_t best_machine = current_machine;
+    unsigned min_tasks = UINT_MAX;
+
+    for (MachineId_t machine_id : machines) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        if (machine_id != current_machine && 
+            machine_info.active_tasks < min_tasks) {
+            min_tasks = machine_info.active_tasks;
+            best_machine = machine_id;
+        }
+    }
+
+    return best_machine;
+}
+
 void Scheduler::Init() {
     // Get actual number of machines from the system
     unsigned total_machines = Machine_GetTotal();
-    active_machines = total_machines;  // Use actual total instead of hardcoded value
+    active_machines = total_machines;
 
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler with diverse machine types", 1);
 
     // Populate 'machines' vector with all MachineId_t
-    // Assuming MachineId_t can be retrieved sequentially from 0 to total_machines - 1
     for(unsigned i = 0; i < active_machines; i++) {
-        MachineId_t machine_id = i; // Ensure this correctly represents the actual machine IDs
+        MachineId_t machine_id = i;
         machines.push_back(machine_id);
     }
 
@@ -39,20 +60,7 @@ void Scheduler::Init() {
     for(auto machine_id : machines) {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
 
-        VMType_t vm_type;
-        switch(machine_info.cpu) {
-            case X86:
-                vm_type = LINUX;
-                break;
-            case ARM:
-                vm_type = LINUX; // Assuming LINUX for ARM; adjust if needed
-                break;
-            case POWER:
-                vm_type = AIX;
-                break;
-            default:
-                vm_type = LINUX; // Default to LINUX if CPU type is unrecognized
-        }
+        VMType_t vm_type = (machine_info.cpu == POWER) ? AIX : LINUX;
 
         // Adjust VM creation based on GPU availability
         // If the machine has GPUs and the VM type supports it, create appropriate VM
@@ -63,28 +71,6 @@ void Scheduler::Init() {
         SimOutput("Init(): VM " + to_string(vm_id) + " created and attached to Machine " + to_string(machine_id), 3);
     }
 }
-
-void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    VMInfo_t vm_info = VM_GetInfo(vm_id);
-    
-    // Remove VM from migrating set
-    migrating_vms.erase(vm_id);
-    
-    // Ensure machine is in high performance mode
-    Machine_SetCorePerformance(vm_info.machine_id, 0, P0);
-}
-
-void WakeUpMachineIfNeeded(MachineId_t machine_id) {
-    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-
-    // Check if the machine is in any state other than S0
-    if (machine_info.s_state != S0) {
-        SimOutput("WakeUpMachineIfNeeded(): Waking up machine " + to_string(machine_id), 3);
-        Machine_SetState(machine_id, S0);
-    }
-}
-
-
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     TaskInfo_t task_info = GetTaskInfo(task_id);
@@ -135,7 +121,8 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
         MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
         if(machine_info.s_state != S0) {
-            WakeUpMachineIfNeeded(vm_info.machine_id);
+            SimOutput("WakeUpMachineIfNeeded(): Waking up machine " + to_string(vm_info.machine_id), 3);
+            Machine_SetState(vm_info.machine_id, S0);
             continue; // Skip if machine is not in S0 state
         }
 
@@ -158,10 +145,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         // Calculate available MIPS based on current active tasks
         unsigned active_tasks = machine_info.active_tasks;
         unsigned cpu_count = machine_info.num_cpus;
-        double mips = machine_info.performance[0]; // Assuming P0 state for simplicity
-        double available_mips = mips * cpu_count - (active_tasks * mips * 0.5); // Assuming each task uses half MIPS
+        double mips = machine_info.performance[0];
+        double available_mips = mips * cpu_count - (active_tasks * mips * 0.5);
 
-        // Avoid division by zero
+        // dont divide by 0 lol
         if(available_mips <= 0) continue;
 
         // Calculate estimated runtime based on available MIPS
@@ -235,102 +222,21 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         VMId_t new_vm = VM_Create(vm_type, task_info.required_cpu);
         VM_Attach(new_vm, target_machine);
         vms.push_back(new_vm);
-        // Do not mark as migrating since VM is ready after attachment
-
         // Assign the task to the new VM
         VM_AddTask(new_vm, task_id, priority);
         task_to_vm_map[task_id] = new_vm;
         return;
     }
 
-    // If still no suitable VM found, do not assign the task
+    // If still no suitable VM found, big bad
 }
-MachineId_t FindLessLoadedMachine(MachineId_t current_machine) {
-    MachineId_t best_machine = current_machine;
-    unsigned min_tasks = UINT_MAX;
 
-    for (MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-
-        if (machine_id != current_machine && machine_info.active_tasks < min_tasks) {
-            min_tasks = machine_info.active_tasks;
-            best_machine = machine_id;
-        }
-    }
-
-    return best_machine;
+void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
-    for (VMId_t vm_id : vms) {
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
 
-        for (TaskId_t task_id : vm_info.active_tasks) {
-            if (CheckSLAViolation(task_id, now)) {
-                TaskInfo_t task_info = GetTaskInfo(task_id);
-                // Only focus on SLA2 and SLA3 tasks as per your goal
-                if(task_info.required_sla == SLA2 || task_info.required_sla == SLA3) {
-                    MachineId_t current_machine = vm_info.machine_id;
-
-                    // Find a less-loaded machine
-                    MachineId_t target_machine = FindLessLoadedMachine(current_machine);
-
-                    if (target_machine != current_machine &&
-                        migrating_vms.find(vm_id) == migrating_vms.end()) {
-                        VM_Migrate(vm_id, target_machine);
-                        migrating_vms.insert(vm_id);
-                        SimOutput("PeriodicCheck(): Initiated migration of VM " + to_string(vm_id) +
-                                  " to machine " + to_string(target_machine) + " due to SLA violation", 3);
-                    }
-                }
-            }
-        }
-    }
-
-    // Proactively wake up machines if needed
-    for (MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state != S0 && machine_info.active_tasks == 0) {
-            WakeUpMachineIfNeeded(machine_id);
-        }
-    }
 }
-
-
-
-bool Scheduler::CheckSLAViolation(TaskId_t task_id, Time_t now) {
-    // Get task information
-    TaskInfo_t task_info = GetTaskInfo(task_id);
-
-    // Define SLA thresholds based on SLA type
-    double sla_threshold_multiplier;
-    switch(task_info.required_sla) {
-        case SLA0:
-            sla_threshold_multiplier = 1.2;
-            break;
-        case SLA1:
-            sla_threshold_multiplier = 1.5;
-            break;
-        case SLA2:
-            sla_threshold_multiplier = 2.0;
-            break;
-        case SLA3:
-            sla_threshold_multiplier = 3.0; // Example multiplier for SLA3
-            break;
-        default:
-            sla_threshold_multiplier = 1.0;
-    }
-
-    // Calculate target completion time
-    Time_t target_completion = task_info.arrival + static_cast<Time_t>(task_info.target_completion * sla_threshold_multiplier);
-
-    // A task violates its SLA if it's not completed and past the target completion time
-    if (!task_info.completed && now > target_completion) {
-        return true; // SLA violation
-    }
-    return false; // SLA is still met
-}
-
 
 void Scheduler::Shutdown(Time_t time) {
     // Do your final reporting and bookkeeping here.
@@ -392,10 +298,11 @@ void SchedulerCheck(Time_t time) {
     Scheduler.PeriodicCheck(time);
     static unsigned counts = 0;
     counts++;
-    if (counts == 10 && !migrating) {
-        migrating = true;
-        VM_Migrate(1, 9);
-    }
+
+    // if (counts == 10 && !migrating) {
+    //     migrating = true;
+    //     VM_Migrate(1, 9);
+    // }
 }
 
 void SimulationComplete(Time_t time) {
@@ -412,43 +319,7 @@ void SimulationComplete(Time_t time) {
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    TaskInfo_t task_info = GetTaskInfo(task_id);
-    
-    // Escalate priority if SLA is violated
-    Priority_t new_priority = task_info.priority;
-    switch(task_info.required_sla) {
-        case SLA0:
-        case SLA1:
-            new_priority = MID_PRIORITY; // Adjusted to MID_PRIORITY
-            break;
-        case SLA2:
-        case SLA3:
-            new_priority = HIGH_PRIORITY; // Ensure SLA2 and SLA3 are high priority
-            break;
-        default:
-            new_priority = LOW_PRIORITY;
-    }
-    
-    // Update task priority
-    SetTaskPriority(task_id, new_priority);
-    
-    // Attempt to migrate VM if possible
-    auto it = task_to_vm_map.find(task_id);
-    if (it != task_to_vm_map.end()) {
-        VMId_t vm_id = it->second;
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        MachineId_t current_machine = vm_info.machine_id;
-        
-        // Find a machine with lower load
-        MachineId_t target_machine = FindLessLoadedMachine(current_machine);
-        
-        if (target_machine != current_machine && migrating_vms.find(vm_id) == migrating_vms.end()) {
-            VM_Migrate(vm_id, target_machine);
-            migrating_vms.insert(vm_id);
-            SimOutput("SLAWarning(): Initiated migration of VM " + to_string(vm_id) +
-                      " to machine " + to_string(target_machine) + " due to SLA violation", 3);
-        }
-    }
+
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
