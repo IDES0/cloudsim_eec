@@ -4,81 +4,209 @@
 //
 //  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
 //
-
+#include "Interfaces.h"
 #include "Scheduler.hpp"
-
+#include <unordered_set>
+#include <algorithm>
 static bool migrating = false;
-static unsigned active_machines = 16;
+// static unsigned active_machines = 16;
 
+static vector<VMId_t> vms;
+static vector<MachineId_t> machines;
+static unordered_map<TaskId_t, VMId_t> task_to_vm_map;
+static unordered_map<MachineId_t, unsigned int> machine_task_count;
+static unordered_set<VMId_t> migrating_vms;
+static unsigned active_machines;
 void Scheduler::Init() {
-    // Find the parameters of the clusters
-    // Get the total number of machines
-    // For each machine:
-    //      Get the type of the machine
-    //      Get the memory of the machine
-    //      Get the number of CPUs
-    //      Get if there is a GPU or not
-    // 
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
+    // Get actual number of machines from the system
+    unsigned total_machines = Machine_GetTotal();
+    active_machines = total_machines;  // Use actual total instead of hardcoded 16
+
+    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    for(unsigned i = 0; i < active_machines; i++)
-        vms.push_back(VM_Create(LINUX, X86));
+
+    // Create VMs and track machines based on actual total
     for(unsigned i = 0; i < active_machines; i++) {
+        vms.push_back(VM_Create(LINUX, X86));
         machines.push_back(MachineId_t(i));
     }    
+
+    // Attach VMs to machines
     for(unsigned i = 0; i < active_machines; i++) {
         VM_Attach(vms[i], machines[i]);
     }
-
-    bool dynamic = false;
-    if(dynamic)
-        for(unsigned i = 0; i<4 ; i++)
-            for(unsigned j = 0; j < 8; j++)
-                Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // Turn off the ARM machines
-    for(unsigned i = 24; i < Machine_GetTotal(); i++)
-        Machine_SetState(MachineId_t(i), S5);
-
-    SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " ahd " + to_string(vms[1]), 3);
 }
 
+
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // Update your data structure. The VM now can receive new tasks
+    VMInfo_t vm_info = VM_GetInfo(vm_id);
+    
+    // Turn on high performance mode for the destination machine
+    Machine_SetCorePerformance(vm_info.machine_id, 0, P0);
+    
+    // Update task mappings
+    for(auto& pair : task_to_vm_map) {
+        if(pair.second == vm_id) {
+            pair.second = vm_id;  // Update to new VM location
+        }
+    }
+}
+
+void WakeUpMachineIfNeeded(MachineId_t machine_id) {
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+    // Check if the machine is in any state other than S0
+    if (machine_info.s_state != S0) {
+        SimOutput("WakeUpMachineIfNeeded(): Waking up machine " + to_string(machine_id), 3);
+        Machine_SetState(machine_id, S0);
+    }
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    // Get the task parameters
-    //  IsGPUCapable(task_id);
-    //  GetMemory(task_id);
-    //  RequiredVMType(task_id);
-    //  RequiredSLA(task_id);
-    //  RequiredCPUType(task_id);
-    // Decide to attach the task to an existing VM, 
-    //      vm.AddTask(taskid, Priority_T priority); or
-    // Create a new VM, attach the VM to a machine
-    //      VM vm(type of the VM)
-    //      vm.Attach(machine_id);
-    //      vm.AddTask(taskid, Priority_t priority) or
-    // Turn on a machine, create a new VM, attach it to the VM, then add the task
-    //
-    // Turn on a machine, migrate an existing VM from a loaded machine....
-    //
-    // Other possibilities as desired
-    Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    if(migrating) {
-        VM_AddTask(vms[0], task_id, priority);
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+    unsigned task_memory = GetTaskMemory(task_id); // Get memory requirement of the task
+
+    // Set priority based on SLA
+    Priority_t priority = (task_info.required_sla == SLA0 || task_info.required_sla == SLA1) 
+                         ? HIGH_PRIORITY 
+                         : (task_info.required_sla == SLA2 ? MID_PRIORITY : LOW_PRIORITY);
+
+    VMId_t selected_vm = -1;
+    unsigned min_available_memory = UINT_MAX;
+
+    // Find the best-fit VM that is ready and has enough memory
+    for (VMId_t vm_id : vms) {
+        if (migrating_vms.find(vm_id) != migrating_vms.end()) {
+            continue;  // Skip migrating VMs
+        }
+
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
+
+        // Ensure the machine is in S0 state
+        if (machine_info.s_state != S0) {
+            WakeUpMachineIfNeeded(vm_info.machine_id);
+            continue;  // Skip this VM for now
+        }
+
+        // Calculate available memory on the machine
+        unsigned available_memory = machine_info.memory_size - machine_info.memory_used;
+        if (available_memory >= task_memory) {
+            unsigned remaining_memory = available_memory - task_memory;
+            if (remaining_memory < min_available_memory) {
+                min_available_memory = remaining_memory;
+                selected_vm = vm_id;
+            }
+        }
     }
-    else {
-        VM_AddTask(vms[task_id % active_machines], task_id, priority);
-    }// Skeleton code, you need to change it according to your algorithm
+
+    // Assign the task to the best-fit VM if found
+    if (selected_vm != -1) {
+        try {
+            VM_AddTask(selected_vm, task_id, priority);
+            task_to_vm_map[task_id] = selected_vm;
+            SimOutput("NewTask(): Task " + to_string(task_id) + " assigned to VM " + to_string(selected_vm), 3);
+            return;
+        } catch (const runtime_error& e) {
+            SimOutput("NewTask(): Exception assigning task " + to_string(task_id) +
+                      " to VM " + to_string(selected_vm) + ": " + e.what(), 2);
+        }
+    }
+
+    // If no suitable VM found, attempt to create a new VM on a ready machine with enough memory
+    for (MachineId_t machine_id : machines) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        // Ensure the machine is ready and has enough memory
+        if (machine_info.s_state == S0 && 
+            (machine_info.memory_size - machine_info.memory_used) >= task_memory) {
+            try {
+                VMId_t new_vm = VM_Create(LINUX, machine_info.cpu);
+                VM_Attach(new_vm, machine_id);
+                vms.push_back(new_vm);
+                migrating_vms.insert(new_vm); // Mark the new VM as migrating to prevent immediate assignment
+
+                // Assign the task to the new VM after ensuring it's ready
+                VM_AddTask(new_vm, task_id, priority);
+                task_to_vm_map[task_id] = new_vm;
+                migrating_vms.erase(new_vm); // VM is now ready
+                SimOutput("NewTask(): Task " + to_string(task_id) + " assigned to new VM " + to_string(new_vm) + " on Machine " + to_string(machine_id), 3);
+                return;
+            } catch (const runtime_error& e) {
+                SimOutput("NewTask(): Exception assigning task " + to_string(task_id) +
+                          " to new VM on Machine " + to_string(machine_id) + ": " + e.what(), 2);
+            }
+        }
+    }
+
+    // If still no suitable VM found, log failure
+    SimOutput("NewTask(): No suitable VM found for task " + to_string(task_id), 0);
 }
 
-void Scheduler::PeriodicCheck(Time_t now) {
-    // This method should be called from SchedulerCheck()
-    // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
-    // Unlike the other invocations of the scheduler, this one doesn't report any specific event
-    // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+
+
+
+MachineId_t FindLessLoadedMachine(MachineId_t current_machine) {
+    MachineId_t best_machine = current_machine;
+    unsigned min_tasks = UINT_MAX;
+
+    for (MachineId_t machine_id : machines) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        if (machine_id != current_machine && machine_info.active_tasks < min_tasks) {
+            min_tasks = machine_info.active_tasks;
+            best_machine = machine_id;
+        }
+    }
+
+    return best_machine;
 }
+
+bool CheckSLAViolation(TaskId_t task_id, Time_t now) {
+    // Get task information
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+
+    // A task violates its SLA if it's not completed and past the target completion time
+    if (!task_info.completed && now > task_info.target_completion) {
+        return true; // SLA violation
+    }
+    return false; // SLA is still met
+}
+
+
+void Scheduler::PeriodicCheck(Time_t now) {
+    for (VMId_t vm_id : vms) {
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+
+        for (TaskId_t task_id : vm_info.active_tasks) {
+            if (CheckSLAViolation(task_id, now)) {
+                MachineId_t current_machine = vm_info.machine_id;
+
+                // Find a less-loaded machine
+                MachineId_t target_machine = FindLessLoadedMachine(current_machine);
+
+                if (target_machine != current_machine &&
+                    migrating_vms.find(vm_id) == migrating_vms.end()) {
+                    VM_Migrate(vm_id, target_machine);
+                    migrating_vms.insert(vm_id);
+                    SimOutput("PeriodicCheck(): Initiated migration of VM " + to_string(vm_id) +
+                              " to machine " + to_string(target_machine), 3);
+                }
+            }
+        }
+    }
+
+    // Proactively wake up machines if needed
+    for (MachineId_t machine_id : machines) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if (machine_info.s_state != S0 && machine_info.active_tasks == 0) {
+            WakeUpMachineIfNeeded(machine_id);
+        }
+    }
+}
+
+
+
 
 void Scheduler::Shutdown(Time_t time) {
     // Do your final reporting and bookkeeping here.
@@ -93,10 +221,10 @@ void Scheduler::Shutdown(Time_t time) {
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    // Do any bookkeeping necessary for the data structures
-    // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
-    // This is an opportunity to make any adjustments to optimize performance/energy
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+    auto it = task_to_vm_map.find(task_id);
+    if(it != task_to_vm_map.end()) {
+        task_to_vm_map.erase(it);
+    }
 }
 
 // Public interface below
@@ -124,11 +252,16 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
-    // The function is called on to alert you that migration is complete
-    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
+    // Log migration completion
+    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " completed at time " + to_string(time), 4);
+
+    // Remove from migrating set
+    migrating_vms.erase(vm_id);
+
+    // Complete any additional migration steps (e.g., task updates)
     Scheduler.MigrationComplete(time, vm_id);
-    migrating = false;
 }
+
 
 void SchedulerCheck(Time_t time) {
     // This function is called periodically by the simulator, no specific event
@@ -136,7 +269,7 @@ void SchedulerCheck(Time_t time) {
     Scheduler.PeriodicCheck(time);
     static unsigned counts = 0;
     counts++;
-    if(counts == 10) {
+    if (counts == 10 && !migrating) {
         migrating = true;
         VM_Migrate(1, 9);
     }
@@ -156,10 +289,41 @@ void SimulationComplete(Time_t time) {
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
+    TaskInfo_t task_info = GetTaskInfo(task_id);
     
+    // Escalate priority if SLA is violated
+    Priority_t new_priority = task_info.priority;
+    if (task_info.required_sla == SLA0 || task_info.required_sla == SLA1) {
+        new_priority = HIGH_PRIORITY;
+    } else if (task_info.required_sla == SLA2) {
+        new_priority = MID_PRIORITY;
+    } else {
+        new_priority = HIGH_PRIORITY; // Upgrade SLA3 to higher priority on warning
+    }
+    
+    // Update task priority
+    SetTaskPriority(task_id, new_priority);
+    
+    // Attempt to migrate VM if possible
+    auto it = task_to_vm_map.find(task_id);
+    if (it != task_to_vm_map.end()) {
+        VMId_t vm_id = it->second;
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        MachineId_t current_machine = vm_info.machine_id;
+        
+        // Find a machine with lower load
+        MachineId_t target_machine = FindLessLoadedMachine(current_machine);
+        
+        if (target_machine != current_machine && migrating_vms.find(vm_id) == migrating_vms.end()) {
+            VM_Migrate(vm_id, target_machine);
+            migrating_vms.insert(vm_id);
+            SimOutput("SLAWarning(): Initiated migration of VM " + to_string(vm_id) +
+                      " to machine " + to_string(target_machine) + " due to SLA violation", 3);
+        }
+    }
 }
+
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     // Called in response to an earlier request to change the state of a machine
 }
-

@@ -29,6 +29,5 @@ $(TARGET): $(OBJ)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-# Clean up build files
-clean:
-	rm -f $(OBJ) $(TARGET)
+run:
+	./simulator -v 3 Input.md
