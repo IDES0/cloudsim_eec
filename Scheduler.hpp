@@ -25,6 +25,8 @@ public:
 private:
     vector<VMId_t> vms;
     vector<MachineId_t> machines;
+    bool CheckSLAViolation(TaskId_t task_id, Time_t now);
+    void RotateVMs();
 };
 
 
