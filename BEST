@@ -1,0 +1,16 @@
+Algorithm: Priority-Based Task Scheduling with Resource-Aware VM Allocation
+Energy: 7.25972KW-Hour
+Running Time: 3603.48 sec
+SLA0: 100%
+SLA1: 100%
+SLA2: 100%
+
+
+https://github.com/IDES0/cloudsim_eec
+
+SLA violation report for gentler hour for our Best.cpp
+SLA0: 0%
+SLA1: 0%
+SLA2: 0%
+Total Energy 7.25972KW-Hour
+Simulation run finished in 3603.48 seconds

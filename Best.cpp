@@ -32,8 +32,7 @@ MachineId_t FindLessLoadedMachine(MachineId_t current_machine) {
     for (MachineId_t machine_id : machines) {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
 
-        if (machine_id != current_machine && 
-            machine_info.active_tasks < min_tasks) {
+        if (machine_id != current_machine && machine_info.active_tasks < min_tasks) {
             min_tasks = machine_info.active_tasks;
             best_machine = machine_id;
         }

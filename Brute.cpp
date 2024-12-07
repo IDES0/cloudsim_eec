@@ -32,8 +32,7 @@ MachineId_t FindLessLoadedMachine(MachineId_t current_machine) {
     for (MachineId_t machine_id : machines) {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
 
-        if (machine_id != current_machine && 
-            machine_info.active_tasks < min_tasks) {
+        if (machine_id != current_machine && machine_info.active_tasks < min_tasks) {
             min_tasks = machine_info.active_tasks;
             best_machine = machine_id;
         }
@@ -48,103 +47,133 @@ void Scheduler::Init() {
     active_machines = total_machines;
 
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
+    SimOutput("Scheduler::Init(): Initializing scheduler with diverse machine types", 1);
 
-    // Clear existing data
-    machines.clear();
-    vms.clear();
-    task_to_vm_map.clear();
-    migrating_vms.clear();
-
-    // Populate 'machines' vector
+    // Populate 'machines' vector with all MachineId_t
     for(unsigned i = 0; i < active_machines; i++) {
-        machines.push_back(i);
+        MachineId_t machine_id = i;
+        machines.push_back(machine_id);
     }
 
-    // Create one VM per machine initially
+    // Create and attach VMs based on each machine's CPU type and GPU availability
     for(auto machine_id : machines) {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
         VMType_t vm_type = (machine_info.cpu == POWER) ? AIX : LINUX;
+
+        // Adjust VM creation based on GPU availability
+        // If the machine has GPUs and the VM type supports it, create appropriate VM
+        // Currently, GPU-enabled VMs are treated similarly; adjust if different VM types are required
         VMId_t vm_id = VM_Create(vm_type, machine_info.cpu);
-        if (vm_id) {
-            vms.push_back(vm_id);
-            VM_Attach(vm_id, machine_id);
-            SimOutput("Init(): VM " + to_string(vm_id) + " created and attached to Machine " + to_string(machine_id), 3);
-        }
+        vms.push_back(vm_id);
+        VM_Attach(vm_id, machine_id);
+        SimOutput("Init(): VM " + to_string(vm_id) + " created and attached to Machine " + to_string(machine_id), 3);
     }
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    if (!task_id) return;
-    
-    try {
-        TaskInfo_t task_info = GetTaskInfo(task_id);
-        unsigned task_memory = GetTaskMemory(task_id);
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+    unsigned task_memory = GetTaskMemory(task_id);
 
-        // Set priority based on SLA
-        Priority_t priority = LOW_PRIORITY;
-        switch(task_info.required_sla) {
-            case SLA0: priority = HIGH_PRIORITY; break;
-            case SLA1: priority = MID_PRIORITY; break;
-            case SLA2: priority = MID_PRIORITY; break;
-            case SLA3: priority = LOW_PRIORITY; break;
+    // Set priority based on SLA
+    Priority_t priority = LOW_PRIORITY;
+    switch(task_info.required_sla) {
+        case SLA0: priority = HIGH_PRIORITY; break;
+        case SLA1: case SLA2: priority = MID_PRIORITY; break;
+        default: priority = LOW_PRIORITY;
+    }
+
+    // Brute force: Try every possible VM/machine combination
+    VMId_t best_vm = -1;
+    double best_score = -1;
+
+    for(auto vm_id : vms) {
+        // Skip migrating VMs
+        if(migrating_vms.find(vm_id) != migrating_vms.end()) continue;
+
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
+
+        // Basic compatibility checks
+        if (vm_info.vm_type != task_info.required_vm ||
+            vm_info.cpu != task_info.required_cpu ||
+            (task_info.gpu_capable && !machine_info.gpus) ||
+            (machine_info.memory_size - machine_info.memory_used) < task_memory) {
+            continue;
         }
 
-        // Simple FIFO: Try VMs in order until we find a compatible one
-        for(auto vm_id : vms) {
-            if (!vm_id) continue;
-            
-            VMInfo_t vm_info = VM_GetInfo(vm_id);
-            if (vm_info.machine_id >= Machine_GetTotal()) continue;
-            
-            MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
-            
-            // Check basic compatibility
-            if(vm_info.vm_type != task_info.required_vm ||
-               vm_info.cpu != task_info.required_cpu ||
-               (task_info.gpu_capable && !machine_info.gpus) ||
-               machine_info.memory_size - machine_info.memory_used < task_memory) {
-                continue;
-            }
-            
-            // First compatible VM gets the task
-            VM_AddTask(vm_id, task_id, priority);
-            task_to_vm_map[task_id] = vm_id;
-            SimOutput("NewTask(): Assigned task " + to_string(task_id) + 
-                     " to VM " + to_string(vm_id), 3);
-            return;
+        // Wake up machine if needed
+        if(machine_info.s_state != S0) {
+            Machine_SetState(vm_info.machine_id, S0);
+            continue;
         }
 
-        // If no suitable VM found, create new one on first compatible machine
-        for(auto machine_id : machines) {
-            if (machine_id >= Machine_GetTotal()) continue;
-            
-            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-            
-            // Check compatibility
-            if(machine_info.cpu != task_info.required_cpu ||
-               (task_info.gpu_capable && !machine_info.gpus) ||
-               machine_info.memory_size - machine_info.memory_used < task_memory) {
-                continue;
-            }
-            
-            // First compatible machine gets a new VM
-            VMId_t new_vm = VM_Create(task_info.required_vm, task_info.required_cpu);
-            if (new_vm) {
-                VM_Attach(new_vm, machine_id);
-                vms.push_back(new_vm);
-                VM_AddTask(new_vm, task_id, priority);
-                task_to_vm_map[task_id] = new_vm;
-                SimOutput("NewTask(): Created new VM " + to_string(new_vm) + 
-                         " on machine " + to_string(machine_id) + 
-                         " for task " + to_string(task_id), 3);
-                return;
-            }
-        }
+        // Calculate performance score
+        double available_mips = machine_info.performance[0] * machine_info.num_cpus - 
+                              (machine_info.active_tasks * machine_info.performance[0] * 0.5);
+        if(available_mips <= 0) continue;
+
+        double estimated_runtime = static_cast<double>(task_info.total_instructions) / available_mips;
         
-        SimOutput("NewTask(): Could not find or create suitable VM for task " + 
-                 to_string(task_id), 0);
-    } catch (const exception& e) {
-        SimOutput("NewTask(): Exception: " + string(e.what()), 0);
+        // Calculate SLA deadline
+        double sla_multiplier = (task_info.required_sla == SLA0) ? 1.2 :
+                              (task_info.required_sla == SLA1) ? 1.5 :
+                              (task_info.required_sla == SLA2) ? 2.0 : 3.0;
+        
+        Time_t sla_deadline = task_info.arrival + static_cast<Time_t>(task_info.target_completion * sla_multiplier);
+        Time_t estimated_finish_time = now + static_cast<Time_t>(estimated_runtime);
+
+        // Score calculation - lower is better
+        double score = estimated_finish_time;
+        
+        // Penalties for various factors
+        if(machine_info.active_tasks > 0) score *= 1.1;  // Slight penalty for busy machines
+        if(machine_info.memory_used > machine_info.memory_size * 0.8) score *= 1.2;  // Memory pressure penalty
+        
+        // If we can meet SLA and this is the best score so far
+        if(estimated_finish_time <= sla_deadline && (best_vm == -1 || score < best_score)) {
+            best_vm = vm_id;
+            best_score = score;
+        }
+    }
+
+    // If we found a suitable VM, assign the task
+    if(best_vm != -1) {
+        VM_AddTask(best_vm, task_id, priority);
+        task_to_vm_map[task_id] = best_vm;
+        return;
+    }
+
+    // If no suitable VM found, create new VM on best available machine
+    MachineId_t best_machine = -1;
+    double best_machine_score = -1;
+
+    for(auto machine_id : machines) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        // Basic compatibility checks
+        if(machine_info.cpu != task_info.required_cpu ||
+           (task_info.gpu_capable && !machine_info.gpus) ||
+           (machine_info.memory_size - machine_info.memory_used) < task_memory) {
+            continue;
+        }
+
+        // Score calculation for machines
+        double score = machine_info.performance[0] * machine_info.num_cpus;
+        score /= (machine_info.active_tasks + 1);  // Account for current load
+        
+        if(best_machine == -1 || score > best_machine_score) {
+            best_machine = machine_id;
+            best_machine_score = score;
+        }
+    }
+
+    if(best_machine != -1) {
+        VMId_t new_vm = VM_Create(task_info.required_vm, task_info.required_cpu);
+        VM_Attach(new_vm, best_machine);
+        vms.push_back(new_vm);
+        VM_AddTask(new_vm, task_id, priority);
+        task_to_vm_map[task_id] = new_vm;
     }
 }
 
@@ -152,14 +181,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
-    // Simple periodic check - no special handling needed for FIFO
-    for(auto machine_id : machines) {
-        if (machine_id >= Machine_GetTotal()) continue;
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if(machine_info.active_tasks == 0) {
-            // Machine is idle
-        }
-    }
+
 }
 
 void Scheduler::Shutdown(Time_t time) {

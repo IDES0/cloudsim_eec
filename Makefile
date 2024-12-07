@@ -5,32 +5,49 @@ CXXFLAGS = -Wall -std=c++17
 # Include directories
 INCLUDES = -I.
 
-# Source files
-SRC = Init.cpp Machine.cpp main.cpp Scheduler.cpp Simulator.cpp Task.cpp VM.cpp
+# Common object files
+COMMON_OBJ = Init.o Machine.o main.o Simulator.o Task.o VM.o
 
-# Object files
-OBJ = $(SRC:.cpp=.o)
+# Different scheduler implementations
+SCHEDULER_SOURCES = Best.cpp Brute.cpp Greedy.cpp
+SCHEDULER_OBJ = Best.o Brute.o Greedy.o
 
 # Executable
 TARGET = simulator
 
 # Default target
-all: $(TARGET)
-
-# Default target
-scheduler: $(OBJ)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o scheduler $(OBJ)
-
-# Build target
-$(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(TARGET) $(OBJ)
+all: $(SCHEDULER_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o best_scheduler $(COMMON_OBJ) Best.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o brute_scheduler $(COMMON_OBJ) Brute.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o greedy_scheduler $(COMMON_OBJ) Greedy.o
 
 # Compile source files into object files
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+best: Best.o $(COMMON_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o best_scheduler $(COMMON_OBJ) Best.o
+
+brute: Brute.o $(COMMON_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o brute_scheduler $(COMMON_OBJ) Brute.o
+
+greedy: Greedy.o $(COMMON_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o greedy_scheduler $(COMMON_OBJ) Greedy.o
+
+clean:
+	rm -f *.o best_scheduler brute_scheduler greedy_scheduler
+
 run:
 	./simulator -v 3 Input.md
+
+run_best:
+	./best_scheduler -v 3 Input.md
+
+run_brute:
+	./brute_scheduler -v 3 Input.md
+
+run_greedy:
+	./greedy_scheduler -v 3 Input.md
 
 hour:
 	./simulator -v 3 GentlerHour
